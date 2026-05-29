@@ -39,6 +39,12 @@ class Settings(BaseSettings):
     ai_temperature: float       # AI_TEMPERATURE
     ai_max_tokens: int          # AI_MAX_TOKENS
 
+    # ── УВЕДОМЛЕНИЯ АДМИНИСТРАТОРА ────────────────────────────────────────────
+    # Telegram chat_id владельца/администратора для получения алертов.
+    # Если не задан — уведомления отключены (None).
+    # Как узнать свой chat_id: написать @userinfobot в Telegram.
+    admin_chat_id: int | None = None   # ADMIN_CHAT_ID
+
 
 # Singleton — импортируй везде как: from core.config import settings
 settings = Settings()
