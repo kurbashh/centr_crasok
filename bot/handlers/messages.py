@@ -1,205 +1,338 @@
 """
 bot/handlers/messages.py — Обработчики входящих сообщений.
 
-Ответственность (только Telegram-слой):
-  1. Маршрутизировать по типу контента (текст / всё остальное).
-  2. Координировать вызовы ContextService и AIService.
-  3. Показывать «typing» во время генерации ответа.
-  4. Обрабатывать ошибки и возвращать понятные сообщения пользователю.
+Форматирование ответов: telegramify-markdown (entities-подход)
+═══════════════════════════════════════════════════════════════
+Gemini возвращает стандартный Markdown. Telegram его не понимает напрямую.
 
-Handler НЕ содержит бизнес-логики — только оркестрация сервисов.
+Три варианта и почему мы выбрали третий:
+
+  parse_mode=MARKDOWN   — legacy, ломается на VOC_free, centr_krasok.kz,
+                          8*12, незакрытых backtick'ах → E303 в логах.
+
+  parse_mode=HTML       — надёжнее, но LLM всё равно пишет Markdown.
+                          Нужна конвертация, и незакрытый <tag> тоже упадёт.
+
+  entities (текущий)    — telegramify_markdown.convert() парсит Markdown
+                          в (plain_text, list[AiogramEntity]) локально.
+                          Telegram получает уже готовые entity-офсеты.
+                          parse_mode не передаётся вообще.
+                          Невалидный Markdown → graceful деградация в plain text.
+                          E303 физически невозможен.
+
+Установка зависимости:
+  pip install telegramify-markdown
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import io
-import tempfile
 import os
+import tempfile
 
 from aiogram import Router
-from aiogram.enums import ChatAction, ParseMode
-from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.enums import ChatAction
+from aiogram.exceptions import TelegramBadRequest, TelegramAPIError
 from aiogram.filters import BaseFilter
-from aiogram.types import Message
+from aiogram.types import (
+    FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+    MessageEntity as AiogramEntity,
+)
+from telegramify_markdown import convert as md_to_entities
 
 import services.ai_service as ai_service_mod
+from core.errors import AppError, ErrorCode, AIServiceError
+from core.logging import log_flow, RequestContext
 from services.context_service import context_service
 
 logger = logging.getLogger(__name__)
 messages_router = Router(name="messages")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Тексты системных сообщений (минималистичный стиль)
-# ─────────────────────────────────────────────────────────────────────────────
+_CHUNK_SIZE: int = 4000        # Telegram limit 4096, берём с запасом
+_TYPING_INTERVAL: float = 4.0  # Telegram сбрасывает typing через 5 с
 
-_MSG_NON_TEXT: str = (
-    "Я работаю только с текстовыми вопросами. Пожалуйста, напишите свой вопрос."
-)
-
-_MSG_RATE_LIMIT: str = (
-    "AI-сервис временно перегружен. Пожалуйста, повторите запрос через несколько секунд."
-)
-
-_MSG_ERROR: str = (
-    "Произошла ошибка при обработке запроса. Попробуйте позже или напишите: info@centr-krasok.kz"
-)
-
-_MSG_EMPTY: str = (
-    "Пожалуйста, напишите ваш вопрос о краске, грунтовке или материалах для отделки."
-)
-
-# Интервал повторной отправки «typing» в секундах (Telegram сбрасывает его через 5 с)
-_TYPING_INTERVAL: float = 4.0
-
-# Клавиатура обратной связи
 feedback_kb = InlineKeyboardMarkup(inline_keyboard=[[
     InlineKeyboardButton(text="✅ Помогло", callback_data="fb_good"),
     InlineKeyboardButton(text="❌ Не помогло", callback_data="fb_bad"),
 ]])
 
 
-# ---------------------------------------------------------------------------
-# Фильтр нетекстовых сообщений
-# ---------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# Фильтр
+# ──────────────────────────────────────────────────────────────────────────────
 
 class IsNonText(BaseFilter):
-    """True, если у входящего сообщения нет текстового содержимого."""
-
     async def __call__(self, message: Message) -> bool:
         return not bool(message.text)
 
 
-# ---------------------------------------------------------------------------
-# Вспомогательная корутина: циклический typing-индикатор
-# ---------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# Форматирование: Markdown → Telegram entities
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _prepare_reply(text: str) -> tuple[str, list[AiogramEntity]]:
+    """
+    Конвертирует Markdown-текст от Gemini в (plain_text, aiogram_entities).
+
+    telegramify_markdown парсит Markdown локально через Rust-биндинги
+    (pyromark/pulldown-cmark). Возвращает plain text + список своих
+    telegramify_markdown.entity.MessageEntity.
+
+    ВАЖНО: telegramify возвращает свой тип MessageEntity, а aiogram ожидает
+    aiogram.types.MessageEntity. Конвертируем через .to_dict() → AiogramEntity(**d).
+
+    При невалидном Markdown деградирует до plain text — никаких исключений.
+    """
+    try:
+        plain_text, tg_entities = md_to_entities(text)
+
+        # Конвертируем telegramify.MessageEntity → aiogram.MessageEntity
+        # .to_dict() возвращает только непустые поля: {'type': 'bold', 'offset': 0, 'length': 6}
+        aiogram_entities = [AiogramEntity(**e.to_dict()) for e in tg_entities]
+
+        logger.debug(
+            "md_to_entities | in=%d chars → out=%d chars | entities=%d",
+            len(text), len(plain_text), len(aiogram_entities),
+        )
+        return plain_text, aiogram_entities
+    except Exception as exc:
+        # Защитный fallback — на случай совсем экзотического ввода
+        logger.warning(
+            "md_to_entities failed, falling back to plain text | %s: %s",
+            type(exc).__name__, exc,
+        )
+        return text, []
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Отправка ответа
+# ──────────────────────────────────────────────────────────────────────────────
+
+async def _send_reply(message: Message, raw_markdown: str) -> None:
+    """
+    Конвертирует Markdown → entities и отправляет сообщение.
+
+    Fallback-цепочка (на случай проблем с самим текстом):
+      1. Entities (основной путь, parse_mode не нужен)
+      2. Plain text без entities (если Telegram отверг entities)
+      3. Разбивка на чанки (если сообщение слишком длинное)
+      4. Файл (если ничего не помогло)
+    """
+    user_id = message.from_user.id  # type: ignore[union-attr]
+    plain_text, entities = _prepare_reply(raw_markdown)
+
+    # ── Попытка 1: entities (без parse_mode) ──────────────────────────────────
+    try:
+        await message.answer(
+            text=plain_text,
+            entities=entities or None,
+            reply_markup=feedback_kb,
+        )
+        logger.debug(
+            "Reply sent | user_id=%d | mode=entities | len=%d | entities=%d",
+            user_id, len(plain_text), len(entities),
+        )
+        return
+    except TelegramBadRequest as exc:
+        exc_lower = str(exc).lower()
+
+        # ── Попытка 2: plain text без entities ────────────────────────────────
+        if "entities" in exc_lower or "parse" in exc_lower:
+            logger.warning(
+                "Entities rejected, retrying plain | user_id=%d | %s",
+                user_id, exc,
+            )
+            try:
+                await message.answer(plain_text, reply_markup=feedback_kb)
+                logger.debug("Reply sent | user_id=%d | mode=plain", user_id)
+                return
+            except TelegramBadRequest as exc2:
+                exc_lower = str(exc2).lower()
+
+        # ── Попытка 3: чанки ──────────────────────────────────────────────────
+        if "message is too long" in exc_lower:
+            logger.warning(
+                "Message too long (%d chars), splitting | user_id=%d",
+                len(plain_text), user_id,
+            )
+            await _send_chunks(message, plain_text, user_id)
+            return
+
+        # ── Попытка 4: файл ───────────────────────────────────────────────────
+        logger.error(
+            "[E302] All text methods failed, sending as file | user_id=%d | %s",
+            user_id, exc,
+        )
+        await _send_as_file(message, plain_text, user_id)
+
+
+async def _send_chunks(message: Message, text: str, user_id: int) -> None:
+    """Разбивает длинный plain-text на чанки по _CHUNK_SIZE символов."""
+    chunks = [text[i:i + _CHUNK_SIZE] for i in range(0, len(text), _CHUNK_SIZE)]
+    total = len(chunks)
+    logger.info("Sending %d chunks | user_id=%d | total_len=%d", total, user_id, len(text))
+
+    for idx, chunk in enumerate(chunks, 1):
+        kb = feedback_kb if idx == total else None
+        try:
+            await message.answer(chunk, reply_markup=kb)
+        except Exception as e:
+            logger.error(
+                "[E302] Chunk %d/%d failed | user_id=%d | %s",
+                idx, total, user_id, e,
+            )
+
+
+async def _send_as_file(message: Message, text: str, user_id: int) -> None:
+    """Последний резерв: отправляет текст .txt-файлом."""
+    tmp = tempfile.NamedTemporaryFile(
+        delete=False, suffix=".txt", prefix="reply_", mode="w", encoding="utf-8"
+    )
+    try:
+        tmp.write(text)
+        tmp.close()
+        await message.answer_document(
+            document=FSInputFile(tmp.name),
+            caption="Ответ прикреплён файлом",
+            reply_markup=feedback_kb,
+        )
+        logger.info("Reply sent as file | user_id=%d | size=%d bytes", user_id, len(text.encode()))
+    except Exception as e:
+        logger.error("[E302] File send failed | user_id=%d | %s", user_id, e)
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except Exception:
+            pass
+
+
+async def _send_error_to_user(message: Message, error: AppError) -> None:
+    """Отправляет user_message из ERROR_CATALOG пользователю."""
+    user_msg = error.user_message
+    if not user_msg:
+        return
+    try:
+        await message.answer(user_msg)
+    except TelegramAPIError as e:
+        logger.error(
+            "[E302] Failed to send error message | user_id=%s | %s",
+            error.user_id, e,
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Вспомогательная корутина typing
+# ──────────────────────────────────────────────────────────────────────────────
 
 async def _keep_typing(chat_id: int, bot) -> None:
-    """
-    Периодически отправляет ChatAction.TYPING, пока не будет отменена.
-    Запускается как asyncio.Task и отменяется после получения ответа от AI.
-    """
     while True:
         try:
             await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
         except Exception as exc:
-            logger.debug("typing action failed: %s", exc)
+            logger.debug("Typing action failed (non-critical) | chat_id=%d | %s", chat_id, exc)
         await asyncio.sleep(_TYPING_INTERVAL)
 
 
-# ---------------------------------------------------------------------------
-# Обработчик нетекстовых сообщений
-# ---------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# Handlers
+# ──────────────────────────────────────────────────────────────────────────────
 
 @messages_router.message(IsNonText())
 async def handle_non_text(message: Message) -> None:
-    """Вежливо отклоняет стикеры, фото, голосовые и прочее."""
-    await message.answer(_MSG_NON_TEXT)
+    content_type = message.content_type.value if message.content_type else "unknown"
+    user_id = message.from_user.id  # type: ignore[union-attr]
+    logger.info("[E101] NON_TEXT_MESSAGE | user_id=%d | content_type=%s", user_id, content_type)
+    err = AppError(
+        code=ErrorCode.NON_TEXT_MESSAGE,
+        user_id=user_id,
+        extra={"content_type": content_type},
+    )
+    await _send_error_to_user(message, err)
 
-
-# ---------------------------------------------------------------------------
-# Основной обработчик — текстовые сообщения
-# ---------------------------------------------------------------------------
 
 @messages_router.message()
 async def handle_text(message: Message) -> None:
-    """
-    Основной flow:
-      1. Валидация текста.
-      2. Старт циклического typing-индикатора.
-      3. Сохранение вопроса в ContextService.
-      4. Получение истории и вызов AIService.
-      5. Сохранение ответа в ContextService.
-      6. Отправка ответа пользователю.
-      7. Гарантированная остановка typing-задачи.
-    """
-    user_id: int = message.from_user.id   # type: ignore[union-attr]
+    user_id: int = message.from_user.id  # type: ignore[union-attr]
     user_text: str = (message.text or "").strip()
 
+    ctx_tokens = RequestContext.set(user_id=user_id, chat_id=message.chat.id)
+    try:
+        await _process_message(message, user_id, user_text)
+    finally:
+        RequestContext.reset(ctx_tokens)
+
+
+async def _process_message(message: Message, user_id: int, user_text: str) -> None:
     if not user_text:
-        await message.answer(_MSG_EMPTY)
+        logger.debug("[E100] EMPTY_MESSAGE | user_id=%d", user_id)
+        err = AppError(code=ErrorCode.EMPTY_MESSAGE, user_id=user_id)
+        await _send_error_to_user(message, err)
         return
 
-    logger.info("MSG | user_id=%d | %.80s", user_id, user_text)
+    logger.info("→ handle_text | user_id=%d | text=%.80s", user_id, user_text)
 
-    # ── Запускаем циклический typing-индикатор ────────────────────────────
+    if ai_service_mod.ai_service is None:
+        err = AppError(code=ErrorCode.AI_NOT_INITIALIZED, user_id=user_id)
+        err.log(logger)
+        await _send_error_to_user(message, err)
+        return
+
     typing_task: asyncio.Task = asyncio.create_task(
         _keep_typing(chat_id=message.chat.id, bot=message.bot)
     )
 
     try:
-        # ── 1. Сохраняем вопрос пользователя ─────────────────────────────
-        await context_service.add_user_message(user_id, user_text)
+        # [1] Сохраняем вопрос
+        try:
+            await context_service.add_user_message(user_id, user_text)
+            logger.debug("Step 1/4: User message saved | user_id=%d", user_id)
+        except Exception as e:
+            logger.warning(
+                "[E500] Context save failed, proceeding | user_id=%d | %s", user_id, e
+            )
 
-        # ── 2. Получаем историю (уже включает текущий вопрос) ─────────────
+        # [2] Получаем историю
         history = await context_service.get_history(user_id)
+        logger.debug("Step 2/4: History retrieved | user_id=%d | msgs=%d", user_id, len(history))
 
-        # ── 3. Генерируем ответ ───────────────────────────────────────────
-        # Проверяем, инициализирован ли AI-сервис (инициализация делается в main.py)
-        if ai_service_mod.ai_service is None:
-            logger.error("AI service is not initialized")
-            await message.answer(_MSG_ERROR)
-            return
-
+        # [3] Генерируем ответ
+        logger.debug("Step 3/4: Calling AI service | user_id=%d", user_id)
         reply = await ai_service_mod.ai_service.generate_response(
             user_id=user_id,
             history=history,
         )
 
-        # ── 4. Сохраняем ответ ассистента ────────────────────────────────
-        await context_service.add_assistant_message(user_id, reply)
-
-        # ── 5. Отправляем ответ ───────────────────────────────────────────
-# Try Markdown, then plain text, then split into chunks or send as a text file.
+        # [4] Сохраняем ответ
         try:
-            await message.answer(reply, parse_mode=ParseMode.MARKDOWN, reply_markup=feedback_kb)
-        except TelegramBadRequest as exc_markdown:
-            logger.warning("Telegram parse error, retrying without parse_mode: %s", exc_markdown)
-            try:
-                # Override bot default parse_mode by explicitly passing None
-                await message.answer(reply, parse_mode=None, reply_markup=feedback_kb)
-            except TelegramBadRequest as exc_plain:
-                # Split into chunks (Telegram 4096 char limit) or send as file
-                if "message is too long" in str(exc_plain).lower():
-                    logger.warning("Message too long, splitting into chunks: %s", exc_plain)
-                    chunk_size = 4000
-                    chunks = [reply[i:i+chunk_size] for i in range(0, len(reply), chunk_size)]
-                    for i, chunk in enumerate(chunks, 1):
-                        try:
-                            # Добавляем кнопки только к последнему фрагменту
-                            kb = feedback_kb if i == len(chunks) else None
-                            await message.answer(chunk, parse_mode=None, reply_markup=kb)
-                        except Exception as e:
-                            logger.error("Failed to send chunk %d: %s", i, e)
-                else:
-                    # Other parse errors: send as file
-                    logger.exception("Failed sending reply as text; sending as file. | %s", exc_plain)
-                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".txt", prefix="reply_", mode="w", encoding="utf-8")
-                    try:
-                        tmp.write(reply)
-                        tmp.close()
-                        # Use FSInputFile for local files on all platforms
-                        await message.answer_document(document=FSInputFile(tmp.name), caption="Ответ (файл)", reply_markup=feedback_kb)
-                    finally:
-                        try:
-                            os.unlink(tmp.name)
-                        except Exception:
-                            logger.debug("Failed to delete temp file %s", tmp.name)
+            await context_service.add_assistant_message(user_id, reply)
+            logger.debug("Step 4/4: Assistant message saved | user_id=%d", user_id)
+        except Exception as e:
+            logger.warning(
+                "[E500] Context save (assistant) failed | user_id=%d | %s", user_id, e
+            )
 
-    except Exception as e:
-            # Специальная обработка ошибок AI-сервиса для понятных UX-сообщений
-            if isinstance(e, ai_service_mod.AIRateLimitError):
-                await message.answer(_MSG_RATE_LIMIT)
-                logger.exception("AI RateLimit | user_id=%d: %s", user_id, e)
-            elif isinstance(e, ai_service_mod.AIConnectionError):
-                await message.answer(_MSG_RATE_LIMIT)
-                logger.exception("AI ConnectionError | user_id=%d: %s", user_id, e)
-            else:
-                await message.answer(_MSG_ERROR)
-                logger.exception("Ошибка при обработке запроса AI | user_id=%d: %s", user_id, e)
+        # [5] Отправляем (entities-режим, без parse_mode)
+        await _send_reply(message, reply)
+        logger.info("✓ handle_text complete | user_id=%d | reply_len=%d", user_id, len(reply))
+
+    except AppError as err:
+        err.log(logger)
+        await _send_error_to_user(message, err)
+
+    except Exception as exc:
+        err = AppError(
+            code=ErrorCode.INTERNAL_UNKNOWN,
+            user_id=user_id,
+            extra={"detail": f"{type(exc).__name__}: {exc}"},
+            cause=exc,
+        )
+        err.log(logger)
+        await _send_error_to_user(message, err)
 
     finally:
-            # ── Гарантированно останавливаем typing ──────────────────────────
-            typing_task.cancel()
+        typing_task.cancel()
+        logger.debug("Typing cancelled | user_id=%d", user_id)

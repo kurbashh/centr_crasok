@@ -2,3 +2,4 @@ aiogram==3.13.0
 pydantic-settings==2.6.1
 python-dotenv==1.0.1
 google-genai>=1.0.0
+telegramify-markdown>=1.0.0
