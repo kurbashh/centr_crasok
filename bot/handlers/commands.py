@@ -11,7 +11,7 @@ import logging
 
 from aiogram import Router
 from aiogram.filters import Command
-from aiogram.types import Message
+from aiogram.types import Message, CallbackQuery
 from aiogram.exceptions import TelegramAPIError
 
 logger = logging.getLogger(__name__)
@@ -23,14 +23,14 @@ commands_router = Router(name="commands")
 # ─────────────────────────────────────────────────────────────────────────────
 
 _MSG_START: str = (
-    "Привет! Я помощник Центра Красок #1.\n\n"
-    "Помогу с выбором краски, грунтовки, штукатурки, расчетом расхода и колеровкой.\n\n"
-    "Примеры вопросов:\n"
-    "— Какую краску выбрать для ванной?\n"
-    "— Сколько краски нужно на 50 кв.м?\n"
-    "— Какая штукатурка даст эффект шёлка?\n"
-    "— Что такое VOC в краске?\n\n"
-    "Просто напишите свой вопрос 🎨"
+    "Сәлем! Привет! 👋\n\n"
+    "Я консультант Центра Красок #1 — говорю на казахском и русском.\n\n"
+    "Помогу с:\n"
+    "— Выбором краски для любой поверхности\n"
+    "— Расчётом расхода материалов\n"
+    "— Подбором оттенка (45 000+ цветов по RAL, NCS, Pantone)\n"
+    "— Декоративными штукатурками и спецпокрытиями\n\n"
+    "Просто напишите свой вопрос о красках и отделке 🎨"
 )
 
 _MSG_HELP: str = (
@@ -95,6 +95,22 @@ async def cmd_start(message: Message) -> None:
             e,
             exc_info=True,
         )
+
+
+@commands_router.callback_query(lambda c: c.data.startswith("fb_"))
+async def handle_feedback(callback: CallbackQuery) -> None:
+    """Обрабатывает нажатия на кнопки фидбека."""
+    if callback.data == "fb_good":
+        await callback.answer("Рад помочь! 🎨", show_alert=False)
+    else:
+        await callback.answer("Спасибо за отзыв, передам специалистам.", show_alert=False)
+        logger.info("NEGATIVE_FEEDBACK | user_id=%d | msg_id=%d",
+                    callback.from_user.id, 
+                    callback.message.message_id if callback.message else 0)
+    
+    # Убираем кнопки после нажатия
+    if callback.message:
+        await callback.message.edit_reply_markup(reply_markup=None)
 
 
 @commands_router.message(Command("help"))

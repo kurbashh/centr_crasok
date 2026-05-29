@@ -21,7 +21,7 @@ import os
 from aiogram import Router
 from aiogram.enums import ChatAction, ParseMode
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import FSInputFile
+from aiogram.types import FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import BaseFilter
 from aiogram.types import Message
 
@@ -148,12 +148,12 @@ async def handle_text(message: Message) -> None:
         # ── 5. Отправляем ответ ───────────────────────────────────────────
 # Try Markdown, then plain text, then split into chunks or send as a text file.
         try:
-            await message.answer(reply, parse_mode=ParseMode.MARKDOWN)
+            await message.answer(reply, parse_mode=ParseMode.MARKDOWN, reply_markup=feedback_kb)
         except TelegramBadRequest as exc_markdown:
             logger.warning("Telegram parse error, retrying without parse_mode: %s", exc_markdown)
             try:
                 # Override bot default parse_mode by explicitly passing None
-                await message.answer(reply, parse_mode=None)
+                await message.answer(reply, parse_mode=None, reply_markup=feedback_kb)
             except TelegramBadRequest as exc_plain:
                 # Split into chunks (Telegram 4096 char limit) or send as file
                 if "message is too long" in str(exc_plain).lower():
@@ -162,7 +162,9 @@ async def handle_text(message: Message) -> None:
                     chunks = [reply[i:i+chunk_size] for i in range(0, len(reply), chunk_size)]
                     for i, chunk in enumerate(chunks, 1):
                         try:
-                            await message.answer(chunk, parse_mode=None)
+                            # Добавляем кнопки только к последнему фрагменту
+                            kb = feedback_kb if i == len(chunks) else None
+                            await message.answer(chunk, parse_mode=None, reply_markup=kb)
                         except Exception as e:
                             logger.error("Failed to send chunk %d: %s", i, e)
                 else:
@@ -173,7 +175,7 @@ async def handle_text(message: Message) -> None:
                         tmp.write(reply)
                         tmp.close()
                         # Use FSInputFile for local files on all platforms
-                        await message.answer_document(document=FSInputFile(tmp.name), caption="Ответ (файл)")
+                        await message.answer_document(document=FSInputFile(tmp.name), caption="Ответ (файл)", reply_markup=feedback_kb)
                     finally:
                         try:
                             os.unlink(tmp.name)
