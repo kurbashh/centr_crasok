@@ -19,8 +19,9 @@ from bot import create_dispatcher
 from core.config import settings
 from core.logging import setup_logging
 
-from services.ai_service import AIService
-import services.ai_service
+# ПРАВИЛЬНЫЙ ИМПОРТ: Забираем только функцию инициализации, 
+# чтобы избежать циклических зависимостей
+from services.ai_service import init_ai_service
 
 
 async def main() -> None:
@@ -33,9 +34,10 @@ async def main() -> None:
         default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN),
     )
 
-    dp = create_dispatcher()
+    # --- ВАЖНО: Инициализируем AI-сервис ДО запуска диспетчера ---
+    await init_ai_service()
 
-    services.ai_service.ai_service = await AIService.create()
+    dp = create_dispatcher()
 
     # Сброс webhook и накопленных обновлений перед стартом
     await bot.delete_webhook(drop_pending_updates=True)

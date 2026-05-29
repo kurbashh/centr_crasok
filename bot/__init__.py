@@ -7,6 +7,7 @@ bot.py импортирует только create_dispatcher() и не знае�
 
 from aiogram import Dispatcher
 
+from bot.handlers.commands import commands_router
 from bot.handlers.messages import messages_router
 from bot.middlewares.typing_middleware import TypingMiddleware
 
@@ -20,6 +21,9 @@ def create_dispatcher() -> Dispatcher:
     dp.message.middleware(TypingMiddleware())
 
     # ── Роутеры ──────────────────────────────────────────────────────────────
+    # Команды (выше приоритет — обрабатываются первыми)
+    dp.include_router(commands_router)
+    # Обычные текстовые сообщения
     dp.include_router(messages_router)
 
     return dp
