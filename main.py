@@ -18,9 +18,6 @@ from aiogram.enums import ParseMode
 from bot import create_dispatcher
 from core.config import settings
 from core.logging import setup_logging
-
-# ПРАВИЛЬНЫЙ ИМПОРТ: Забираем только функцию инициализации, 
-# чтобы избежать циклических зависимостей
 from services.ai_service import init_ai_service
 
 
@@ -34,7 +31,7 @@ async def main() -> None:
         default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN),
     )
 
-    # --- ВАЖНО: Инициализируем AI-сервис ДО запуска диспетчера ---
+    # Инициализируем AI-сервис ДО запуска диспетчера
     await init_ai_service()
 
     dp = create_dispatcher()
@@ -44,7 +41,11 @@ async def main() -> None:
     logger.info("Polling запущен. Ожидание сообщений…")
 
     try:
-        await dp.start_polling(bot, allowed_updates=["message"])
+        # callback_query нужен для кнопок фидбэка (fb_good / fb_bad)
+        await dp.start_polling(
+            bot,
+            allowed_updates=["message", "callback_query"],
+        )
     finally:
         await bot.session.close()
         logger.info("Бот остановлен.")
