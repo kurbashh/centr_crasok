@@ -54,6 +54,12 @@ _MSG_EMPTY: str = (
 # Интервал повторной отправки «typing» в секундах (Telegram сбрасывает его через 5 с)
 _TYPING_INTERVAL: float = 4.0
 
+# Клавиатура обратной связи
+feedback_kb = InlineKeyboardMarkup(inline_keyboard=[[
+    InlineKeyboardButton(text="✅ Помогло", callback_data="fb_good"),
+    InlineKeyboardButton(text="❌ Не помогло", callback_data="fb_bad"),
+]])
+
 
 # ---------------------------------------------------------------------------
 # Фильтр нетекстовых сообщений
