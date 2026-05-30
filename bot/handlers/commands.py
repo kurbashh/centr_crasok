@@ -15,6 +15,7 @@ from aiogram.types import Message, CallbackQuery
 from aiogram.exceptions import TelegramAPIError
 
 from core.config import settings
+from services.context_service import context_service
 
 logger = logging.getLogger(__name__)
 commands_router = Router(name="commands")
@@ -86,6 +87,13 @@ _MSG_ABOUT: str = (
 # Вспомогательная функция: отправка алерта администратору
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _escape_markdown(text: str) -> str:
+    """Экранирует специальные символы Markdown v1 для безопасной отправки."""
+    for char in ("*", "_", "`", "["):
+        text = text.replace(char, f"\\{char}")
+    return text
+
+
 async def _notify_admin_negative_feedback(
     bot: Bot,
     callback: CallbackQuery,
@@ -95,8 +103,8 @@ async def _notify_admin_negative_feedback(
 
     Что включает алерт:
       — Идентификатор пользователя и его имя/username
-      — Текст сообщения бота, на которое пожаловались
-      — Ссылка на диалог (если чат не приватный — будет ссылка)
+      — Текст вопроса пользователя (извлеченный из истории)
+      — Текст ответа бота, на который пожаловались
       — Временна́я метка
 
     Если ADMIN_CHAT_ID не задан в .env — уведомление молча пропускается.
@@ -109,8 +117,8 @@ async def _notify_admin_negative_feedback(
     msg = callback.message
 
     # Формируем строку с идентификатором пользователя
-    user_mention = f"@{user.username}" if user.username else f"id={user.id}"
-    user_full_name = user.full_name or "—"
+    user_mention = f"@{_escape_markdown(user.username)}" if user.username else f"id={user.id}"
+    user_full_name = _escape_markdown(user.full_name or "—")
 
     # Извлекаем текст ответа бота (то сообщение, под которым кнопки)
     bot_reply_text = ""
@@ -120,6 +128,40 @@ async def _notify_admin_negative_feedback(
         if len(msg.text) > 300:
             bot_reply_text += "…"
 
+    # Пытаемся восстановить вопрос пользователя из истории контекста
+    user_question = ""
+    try:
+        history = await context_service.get_history(user.id)
+        if history:
+            bot_text = msg.text if (msg and msg.text) else ""
+            found_idx = -1
+            if bot_text:
+                # Ищем последнее совпадение ответа ассистента в истории
+                for idx in range(len(history) - 1, -1, -1):
+                    msg_item = history[idx]
+                    if msg_item.get("role") == "assistant" and msg_item.get("content") in bot_text:
+                        found_idx = idx
+                        break
+            
+            # Нашли ответ ассистента -> ищем ближайший вопрос пользователя до него
+            if found_idx > 0:
+                for idx in range(found_idx - 1, -1, -1):
+                    if history[idx].get("role") == "user":
+                        user_question = history[idx].get("content", "")
+                        break
+            
+            # Резервный вариант: если точное совпадение не найдено, берем самый последний вопрос пользователя
+            if not user_question:
+                for msg_item in reversed(history):
+                    if msg_item.get("role") == "user":
+                        user_question = msg_item.get("content", "")
+                        break
+    except Exception as exc:
+        logger.warning(
+            "Failed to retrieve user question from history for admin alert | user_id=%d | %s: %s",
+            user.id, type(exc).__name__, exc,
+        )
+
     # Собираем алерт
     alert_lines = [
         "🔴 *Негативный фидбэк*",
@@ -128,11 +170,25 @@ async def _notify_admin_negative_feedback(
         f"🆔 user\\_id: `{user.id}`",
     ]
 
+    # Добавляем вопрос пользователя, если нашли его
+    if user_question:
+        short_question = user_question[:300]
+        if len(user_question) > 300:
+            short_question += "…"
+        escaped_question = _escape_markdown(short_question)
+        alert_lines += [
+            "",
+            "❓ *Вопрос пользователя:*",
+            f"_{escaped_question}_",
+        ]
+
+    # Добавляем ответ бота
     if bot_reply_text:
+        escaped_reply = _escape_markdown(bot_reply_text)
         alert_lines += [
             "",
             "💬 *Ответ бота, который не помог:*",
-            f"_{bot_reply_text}_",
+            f"_{escaped_reply}_",
         ]
 
     alert_text = "\n".join(alert_lines)
