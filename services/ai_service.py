@@ -42,6 +42,7 @@ from core.errors import (
     AppError,
 )
 from core.logging import log_flow
+from data.company_context import SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
 
@@ -92,7 +93,8 @@ class AIService:
                     "Knowledge base not found at %s — using fallback prompt", kb_path
                 )
 
-            system_instruction = _build_system_prompt(base_knowledge)
+            # Форматируем системный промпт, подставляя факты о компании
+            system_instruction = SYSTEM_PROMPT.replace("{COMPANY_CONTEXT}", base_knowledge)
 
             client = genai.Client(
                 api_key=settings.gemini_api_key.get_secret_value()
@@ -165,28 +167,7 @@ class AIService:
 # Вспомогательные функции (приватные)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _build_system_prompt(base_knowledge: str) -> str:
-    """Добавляет off-topic guard к базе знаний."""
-    off_topic_guard = """
-
----
-
-## ВАЖНОЕ ПРАВИЛО: Защита от вопросов вне компетенции
-
-Ты помощник компании Центр Красок #1. Отвечай ТОЛЬКО на вопросы, связанные
-с лакокрасочными материалами, грунтовкой, штукатуркой, колеровкой и услугами компании.
-
-ЗАПРЕЩЕНО отвечать на вопросы о программировании, кулинарии, медицине, политике,
-образовании и любых темах, не связанных с красками и отделочными материалами.
-
-Если вопрос выходит за рамки компетенции, вежливо ответь:
-«Я специализируюсь только на лакокрасочных и декоративных материалах. \
-Если есть вопросы о краске или штукатурке — помогу с удовольствием.»
-
-ДОПУСТИМЫЕ ТЕМЫ: выбор краски, расчёт расхода, колеровка, декоративные штукатурки,
-свойства материалов (VOC, адгезия, сушка), бренды компании, услуги, контакты.
-"""
-    return base_knowledge + off_topic_guard
+# _build_system_prompt удален, так как системный промпт теперь загружается из data/company_context.py
 
 
 def _history_to_contents(history: list) -> list[types.Content]:
