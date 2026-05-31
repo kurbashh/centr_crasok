@@ -1,0 +1,17 @@
+services:
+  bot:
+    build: .
+    container_name: center_krasok_bot
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+    # Ограничение размера логов Docker
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    stdin_open: true
+    tty: true
