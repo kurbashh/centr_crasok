@@ -8,7 +8,7 @@ services/ai_service.py — AI-сервис на базе Google Gemini.
 
 Ключевые архитектурные решения:
   — Инициализация через classmethod create() — один раз при старте бота.
-  — knowledge_base.md читается один раз и вшивается в system_instruction.
+  — Системный промпт собирается из data/company_context.py (SYSTEM_PROMPT + COMPANY_CONTEXT).
   — История конвертируется в types.Content[] с ролями "user" / "model".
   — Нативный async через client.aio.models.generate_content().
   — Все исключения — из core.errors (с кодами, user_message, log_level).
@@ -26,8 +26,6 @@ services/ai_service.py — AI-сервис на базе Google Gemini.
 from __future__ import annotations
 
 import logging
-from pathlib import Path
-
 from google import genai
 from google.genai import types
 
@@ -42,7 +40,7 @@ from core.errors import (
     AppError,
 )
 from core.logging import log_flow
-from data.company_context import SYSTEM_PROMPT
+from data.company_context import SYSTEM_PROMPT, COMPANY_CONTEXT
 
 logger = logging.getLogger(__name__)
 
@@ -74,27 +72,18 @@ class AIService:
     @classmethod
     async def create(cls) -> "AIService":
         """
-        Асинхронная фабрика: читает базу знаний, инициализирует клиент.
-        Вызывается один раз из main.py через await init_ai_service().
+        Асинхронная фабрика: собирает системный промпт из company_context.py,
+        инициализирует Gemini-клиент. Вызывается один раз из main.py.
         """
         async with log_flow(logger, "AIService.create", level=logging.INFO):
-            # Читаем базу знаний
-            kb_path = Path(settings.knowledge_base_path)
-            if kb_path.exists():
-                base_knowledge = kb_path.read_text(encoding="utf-8")
-                logger.info(
-                    "Knowledge base loaded | path=%s | size=%d chars",
-                    kb_path,
-                    len(base_knowledge),
-                )
-            else:
-                base_knowledge = "Вы — помощник компании Центр Красок #1."
-                logger.warning(
-                    "Knowledge base not found at %s — using fallback prompt", kb_path
-                )
-
-            # Форматируем системный промпт, подставляя факты о компании
-            system_instruction = SYSTEM_PROMPT.replace("{COMPANY_CONTEXT}", base_knowledge)
+            # Системный промпт и база знаний берутся из data/company_context.py
+            # SYSTEM_PROMPT — инструкции, голос и правила Азизы
+            # COMPANY_CONTEXT — факты о компании, каталог, команда, контакты
+            system_instruction = SYSTEM_PROMPT.replace("{COMPANY_CONTEXT}", COMPANY_CONTEXT)
+            logger.info(
+                "System prompt assembled from company_context.py | size=%d chars",
+                len(system_instruction),
+            )
 
             client = genai.Client(
                 api_key=settings.gemini_api_key.get_secret_value()
